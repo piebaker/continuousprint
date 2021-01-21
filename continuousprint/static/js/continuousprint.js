@@ -355,7 +355,7 @@ $(function() {
 				dataType: "json",
 				headers: {"X-Api-Key":UI_API_KEY},
 				success: function(c) {
-					self.loadQueue();
+					//self.loadQueue();
 				},
 				error: function() {
 					self.loadQueue();
