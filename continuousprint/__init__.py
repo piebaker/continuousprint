@@ -17,6 +17,7 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 	paused = False
 	looped = False
 	item = None;
+	restart_on_cancelled = False
 
 	##~~ SettingsPlugin mixin
 	def get_settings_defaults(self):
@@ -25,8 +26,10 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 			cp_bed_clearing_script="M17 ;enable steppers\nG91 ; Set relative for lift\nG0 Z10 ; lift z by 10\nG90 ;back to absolute positioning\nM190 R25 ; set bed to 25 for cooldown\nG4 S90 ; wait for temp stabalisation\nM190 R30 ;verify temp below threshold\nG0 X200 Y235 ;move to back corner\nG0 X110 Y235 ;move to mid bed aft\nG0 Z1v ;come down to 1MM from bed\nG0 Y0 ;wipe forward\nG0 Y235 ;wipe aft\nG28 ; home",
 			cp_queue_finished="M18 ; disable steppers\nM104 T0 S0 ; extruder heater off\nM140 S0 ; heated bed heater off\nM300 S880 P300 ; beep to show its finished",
 			cp_looped="false",
-			cp_print_history="[]"
-			
+			cp_print_history="[]",
+			cp_restart_on_pause_enabled=False,
+			cp_restart_on_pause_max_extrusion=1000,
+			cp_restart_on_pause_max_restarts=3,
 		)
 
 
@@ -43,22 +46,55 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ Event hook
 	def on_event(self, event, payload):
 		try:
-			##  Print complete check it was the print in the bottom of the queue and not just any print
+			## Print complete check it was the print in the bottom of the queue and not just any print
 			if event == Events.PRINT_DONE:
 				if self.enabled == True:
 					self.complete_print(payload)
 
-			# On fail stop all prints
-			if event == Events.PRINT_FAILED or event == Events.PRINT_CANCELLED:
-				self.enabled = False # Set enabled to false
-				self._plugin_manager.send_plugin_message(self._identifier, dict(type="error", msg="Print queue cancelled"))
+
+			# If print is paused (e.g. manual user action or print failure detection automation such as Spaghetti Detective) then
+			# optionally repeat the print if we haven't extruded more than `cp_restart_on_pause_max_extrusion` filament.
+			if event == Events.PRINT_PAUSED:
+				if self.enabled == True and self.paused == False and self._settings.get_boolean(["cp_restart_on_pause_enabled"]):
+					MAX_EPOS = self._settings.get_int(["cp_restart_on_pause_max_extrusion"])
+					MAX_RESTART = self._settings.get_int(["cp_restart_on_pause_max_restarts"])
+					epos = payload["position"]["e"]
+
+					queue = json.loads(self._settings.get(["cp_queue"]))
+					item = queue[0]
+					if "restarts" not in item:
+					    item["restarts"] = 0
+
+					if MAX_EPOS == 0 or epos > MAX_EPOS:
+						self._plugin_manager.send_plugin_message(self._identifier, dict(type="warning", msg=f"Not restarting; extruder pos {epos} beyond limit ({MAX_EPOS})"))
+					elif item["restarts"] >= MAX_RESTART:
+						self._plugin_manager.send_plugin_message(self._identifier, dict(type="warning", msg=f"Not restarting; max restarts reached ({MAX_RESTART})"))
+					else:
+						item["restarts"] += 1
+						self._settings.set(["cp_queue"], json.dumps(queue))
+						self._plugin_manager.send_plugin_message(self._identifier, dict(type="warning", msg=f"Restarting paused print (attempt {item['restarts']} of {MAX_RESTART}"))
+						self.restart_on_cancelled = True
+						self._printer.cancel_print()
+
+			# PRINT_FAILED is triggered directly after PRINT_CANCELLED so we have
+			# to deduplicate them here
+			if (event == Events.PRINT_FAILED and payload['reason'] != "cancelled") or event == Events.PRINT_CANCELLED:
+				if self.restart_on_cancelled:
+				    # Requeue the print if we were told to restart on cancel (see PRINT_PAUSED handling above)
+				    self.restart_on_cancelled = False
+				    self.complete_print(payload, requeue=True)
+				else:
+				    # Stop all prints
+				    self.enabled = False # Set enabled to false
+				    self._plugin_manager.send_plugin_message(self._identifier, dict(type="error", msg="Print queue cancelled"))
+
 
 			if event == Events.PRINTER_STATE_CHANGED:
-					# If the printer is operational and the last print succeeded then we start next print
-					state = self._printer.get_state_id()
-					if state  == "OPERATIONAL":
-						if self.enabled == True and self.paused == False:
-							self.start_next_print()
+				# If the printer is operational and the last print succeeded then we start next print
+				state = self._printer.get_state_id()
+				if state == "OPERATIONAL":
+					if self.enabled == True and self.paused == False:
+						self.start_next_print()
 
 			if event == Events.FILE_SELECTED:
 				# Add some code to clear the print at the bottom
@@ -71,11 +107,14 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 			raise error
 			self._logger.exception("Exception when handling event.")
 
-	def complete_print(self, payload):
+	def complete_print(self, payload, requeue=False):
 		queue = json.loads(self._settings.get(["cp_queue"]))
 		LOOPED=self._settings.get(["cp_looped"])
 		self.item = queue[0]
-		if payload["path"] == self.item["path"] and self.item["count"] > 0:
+		if requeue:
+		    self.clear_bed()
+		    self._plugin_manager.send_plugin_message(self._identifier, dict(type="reload", msg=""))
+		elif payload["path"] == self.item["path"] and self.item["count"] > 0:
 			
 			# check to see if loop count is set. If it is increment times run.
 			
@@ -87,8 +126,10 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 			
 			
 			# On complete_print, remove the item from the queue 
-			# if the item has run for loop count  or no loop count is specified and 
-			# if looped is True requeue the item.
+			# Requeue the item for any of the following:
+			#		- the item has run for loop count
+			#		- no loop count is specified and if looped is True
+			#		- if requeue is True
 			if self.item["times_run"] >= self.item["count"]:
 				self.item["times_run"] = 0
 				queue.pop(0)
@@ -313,6 +354,10 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 	@restricted_access
 	def start_queue(self):
 		self._settings.set(["cp_print_history"], "[]")#Clear Print History
+		queue = json.loads(self._settings.get(["cp_queue"])) # Zero out restart counters
+		for item in queue:
+		    item['restarts'] = 0
+		self._settings.set(["cp_queue"], json.dumps(queue))
 		self._settings.save()
 		self.paused = False
 		self.enabled = True # Set enabled to true
@@ -326,13 +371,16 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 		self.start_next_print()
 		return flask.make_response("success", 200)
 	
-	##~~  TemplatePlugin
+	##~~	TemplatePlugin
 	def get_template_vars(self):
 		return dict(
 			cp_enabled=self.enabled,
 			cp_bed_clearing_script=self._settings.get(["cp_bed_clearing_script"]),
 			cp_queue_finished=self._settings.get(["cp_queue_finished"]),
-			cp_paused=self.paused
+			cp_paused=self.paused,
+			cp_restart_on_pause_enabled=self._settings.get_boolean(["cp_restart_on_pause_enabled"]),
+			cp_restart_on_pause_max_extrusion=self._settings.get_int(["cp_restart_on_pause_max_extrusion"]),
+			cp_restart_on_pause_max_restarts=self._settings.get_int(["cp_restart_on_pause_max_restarts"]),
 		)
 	def get_template_configs(self):
 		return [
@@ -363,14 +411,14 @@ class ContinuousprintPlugin(octoprint.plugin.SettingsPlugin,
 				repo="continuousprint",
 				current=self._plugin_version,
 				stable_branch=dict(
-				    name="Stable", branch="master", comittish=["master"]
+						name="Stable", branch="master", comittish=["master"]
 				),
 				prerelease_branches=[
-				    dict(
+						dict(
 					name="Release Candidate",
 					branch="rc",
 					comittish=["rc", "master"],
-				    )
+						)
 				],
 				# update method: pip
 				pip="https://github.com/Zinc-OS/continuousprint/archive/{target_version}.zip"
